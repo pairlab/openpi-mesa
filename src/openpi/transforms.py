@@ -6,6 +6,7 @@ from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 import flax.traverse_util as traverse_util
 import jax
 import numpy as np
+import torch
 from openpi_client import image_tools
 
 from openpi.models import tokenizer as _tokenizer
@@ -98,7 +99,16 @@ class RepackTransform(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+
+        def repack(k: str):
+            if "+" in k:
+                components = [flat_item[little_k] for little_k in k.split("+")]
+                for i in range(len(components)):
+                    if components[i].ndim == 0:
+                        components[i] = torch.unsqueeze(components[i], axis=-1)
+                return torch.cat(components, dim=-1)
+            return flat_item[k]
+        return jax.tree.map(repack, self.structure)
 
 
 @dataclasses.dataclass(frozen=True)
