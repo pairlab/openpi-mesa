@@ -90,6 +90,9 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # Optional LeRobot video decoder backend, e.g. "pyav".
+    # If None, LeRobot uses its default backend.
+    video_backend: str | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -639,6 +642,21 @@ _CONFIGS = [
         ),
         batch_size=1,
         model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=60),
+    ),
+    # Example config for training pi0_fast on MESA-70 (lerobot video format)
+    TrainConfig(
+        name="pi0_fast_mesa_70",
+        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=20),
+        data=MESADataConfig(
+            repo_id="REPLACE_WITH_LEROBOT_VIDEO_REPO_ID_OR_PATH",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="vla_benchmark_global"),
+        ),
+        batch_size=1,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
     ),
 
 
