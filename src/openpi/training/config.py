@@ -629,7 +629,7 @@ _CONFIGS = [
         name="pi0_mesa",
         data=MESADataConfig(
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="vla_benchmark_global"),
+            assets=AssetsConfig(asset_id="mesa"),
         ),
         batch_size=1,
         model=pi0_config.Pi0Config(action_horizon=20, max_token_len=24),
@@ -638,7 +638,7 @@ _CONFIGS = [
         name="pi05_mesa",
         data=MESADataConfig(
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="vla_benchmark_global"),
+            assets=AssetsConfig(asset_id="mesa"),
         ),
         batch_size=1,
         model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=60),
