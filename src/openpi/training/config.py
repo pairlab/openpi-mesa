@@ -627,36 +627,63 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_mesa",
-        data=MESADataConfig(
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="mesa"),
-        ),
-        batch_size=1,
         model=pi0_config.Pi0Config(action_horizon=20, max_token_len=24),
-    ),
-    TrainConfig(
-        name="pi05_mesa",
         data=MESADataConfig(
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="mesa"),
-        ),
-        batch_size=1,
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=60),
-    ),
-    # Example config for training pi0_fast on MESA-70 (lerobot video format)
-    TrainConfig(
-        name="pi0_fast_mesa_70",
-        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=20),
-        data=MESADataConfig(
-            repo_id="REPLACE_WITH_LEROBOT_VIDEO_REPO_ID_OR_PATH",
+            repo_id="albertwilcox/mesa-70-lerobot",
             base_config=DataConfig(
                 prompt_from_task=True,
                 video_backend="pyav",
             ),
-            assets=AssetsConfig(asset_id="vla_benchmark_global"),
+            assets=AssetsConfig(asset_id="mesa"),
         ),
         batch_size=1,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+    ),
+    TrainConfig(
+        name="pi05_mesa",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=60),
+        data=MESADataConfig(
+            repo_id="albertwilcox/mesa-70-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    ),
+    TrainConfig(
+        name="pi0_fast_mesa_70",
+        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=20),
+        data=MESADataConfig(
+            repo_id="albertwilcox/mesa-70-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+    ),
+    TrainConfig(
+        name="pg_fm_mesa",
+        model=pi0_config.Pi0Config(action_horizon=20, max_token_len=24),
+        data=MESADataConfig(
+            repo_id="albertwilcox/mesa-70-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa"),
+        ),
+        batch_size=1,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
     ),
 
 
