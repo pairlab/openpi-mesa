@@ -7,19 +7,19 @@ markdown-it-py==3.0.0
 mdurl==0.1.2
     # via markdown-it-py
 numpy==1.26.4
-    # via -r examples/simple_client/requirements.in
+    # via -r requirements.in
 polars==1.30.0
-    # via -r examples/simple_client/requirements.in
-pygments==2.19.1
+    # via -r requirements.in
+pygments==2.20.0
     # via rich
 rich==14.0.0
     # via
-    #   -r examples/simple_client/requirements.in
+    #   -r requirements.in
     #   tyro
 shtab==1.7.2
     # via tyro
 tqdm==4.67.1
-    # via -r examples/simple_client/requirements.in
+    # via -r requirements.in
 typeguard==4.4.2
     # via tyro
 typing-extensions==4.13.2
@@ -27,4 +27,4 @@ typing-extensions==4.13.2
     #   typeguard
     #   tyro
 tyro==0.9.22
-    # via -r examples/simple_client/requirements.in
+    # via -r requirements.in
