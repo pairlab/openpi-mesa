@@ -527,6 +527,56 @@ class MESADataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class MESABimanualDataConfig(DataConfigFactory):
+    """Data config for Mesa bimanual LeRobot datasets (14-D joint-space actions, 3 cameras).
+
+    Matches the schema produced by ``examples/mesa/convert_mesa_data_to_lerobot.py``:
+    ``observation.state`` and ``action`` are both 14-D (``[joint_pos(6), grip(1)]`` per arm),
+    and cameras live under ``observation.images.{egocentric,robot0_eye_in_hand,robot1_eye_in_hand}``.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.egocentric",
+                        "observation/wrist_image": "observation.images.robot0_eye_in_hand",
+                        "observation/wrist_image_right": "observation.images.robot1_eye_in_hand",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Delta on each 6-D joint block; absolute grippers.
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        data_transforms = _transforms.Group(
+            inputs=[
+                mesa_policy.MESABimanualInputs(model_type=model_config.model_type),
+                _transforms.DeltaActions(delta_action_mask),
+            ],
+            outputs=[
+                _transforms.AbsoluteActions(delta_action_mask),
+                mesa_policy.MESAOutputs(action_dim=14),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -654,6 +704,36 @@ _CONFIGS = [
         batch_size=128,
         num_train_steps=50_000,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    ),
+    # LoRA finetune of pi0.5 on a Mesa bimanual LeRobot dataset (14-D joint-space, 3 cameras).
+    TrainConfig(
+        name="pi05_mesa_bimanual_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=MESABimanualDataConfig(
+            repo_id="fchang40/mesa_bimanual_2task",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa_bimanual_2task"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=25_000,
     ),
     TrainConfig(
         name="pi0_fast_mesa_70",

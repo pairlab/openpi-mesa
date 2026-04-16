@@ -72,6 +72,44 @@ class MESAInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class MESABimanualInputs(transforms.DataTransformFn):
+    """Three-camera bimanual variant of :class:`MESAInputs`.
+
+    Expects ``observation/wrist_image_right`` for the second wrist view instead
+    of the zero-filled placeholder used by the single-arm class.
+    """
+
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        base_image = _parse_image(data["observation/image"])
+        left_wrist_image = _parse_image(data["observation/wrist_image"])
+        right_wrist_image = _parse_image(data["observation/wrist_image_right"])
+
+        inputs = {
+            "state": data["observation/state"],
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": left_wrist_image,
+                "right_wrist_0_rgb": right_wrist_image,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_,
+            },
+        }
+
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
 class MESAOutputs(transforms.DataTransformFn):
     """
     This class is used to convert outputs from the model back the the dataset specific format. It is
