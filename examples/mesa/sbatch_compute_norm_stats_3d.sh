@@ -13,7 +13,7 @@
 #
 # Compute normalization statistics for TrainConfig `pi05_mesa_bimanual_lora_3d`.
 # Reads the LeRobot dataset at
-#   $HF_LEROBOT_HOME/fchang40/mesa_bimanual_2task_3d
+#   $HF_LEROBOT_HOME/mesa_bimanual_2task_3d
 # and writes per-feature norm stats (state + actions) to
 #   ./assets/pi05_mesa_bimanual_lora_3d/mesa_bimanual_2task_3d/
 # Must be run before `scripts/train.py` — the data loader errors without it.
@@ -23,7 +23,7 @@ set -euo pipefail
 REPO_DIR="/storage/home/hcoda1/5/fchang40/openpi-mesa"
 cd "$REPO_DIR"
 
-export HF_LEROBOT_HOME="/storage/project/r-agarg35-0"
+export HF_LEROBOT_HOME="/storage/project/r-agarg35-0/shared/vla_benchmark_data/3d_data"
 export UV_PROJECT_ENVIRONMENT="/storage/project/r-agarg35-0/fchang40/venvs/openpi-mesa"
 export UV_CACHE_DIR="/storage/project/r-agarg35-0/fchang40/uv_cache"
 export GIT_LFS_SKIP_SMUDGE=1
@@ -36,7 +36,7 @@ export TEMP="$TMPDIR"
 export TMP="$TMPDIR"
 
 echo "[normstats] node=$(hostname) gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
-echo "[normstats] config=pi05_mesa_bimanual_lora_3d repo_id=fchang40/mesa_bimanual_2task_3d"
+echo "[normstats] config=pi05_mesa_bimanual_lora_3d repo_id=mesa_bimanual_2task_3d"
 
 uv run scripts/compute_norm_stats.py --config-name pi05_mesa_bimanual_lora_3d
 

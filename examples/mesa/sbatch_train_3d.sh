@@ -23,7 +23,7 @@ REPO_DIR="/storage/home/hcoda1/5/fchang40/openpi-mesa"
 PROJECT_DIR="/storage/project/r-agarg35-0/fchang40"
 cd "$REPO_DIR"
 
-export HF_LEROBOT_HOME="/storage/project/r-agarg35-0"
+export HF_LEROBOT_HOME="/storage/project/r-agarg35-0/shared/vla_benchmark_data/3d_data"
 export UV_PROJECT_ENVIRONMENT="$PROJECT_DIR/venvs/openpi-mesa"
 export UV_CACHE_DIR="$PROJECT_DIR/uv_cache"
 export OPENPI_DATA_HOME="$PROJECT_DIR/openpi_cache"

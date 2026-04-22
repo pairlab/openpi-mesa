@@ -828,7 +828,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=MESABimanualAdapt3RDataConfig(
-            repo_id="fchang40/mesa_bimanual_2task_3d",
+            repo_id="mesa_bimanual_2task_3d",
             base_config=DataConfig(
                 prompt_from_task=True,
                 video_backend="pyav",
