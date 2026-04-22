@@ -87,7 +87,7 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
-        observation = _model.Observation.from_dict(inputs)
+        observation = _model.observation_from_dict(inputs)
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],

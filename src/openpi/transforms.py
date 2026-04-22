@@ -202,6 +202,46 @@ class ResizeImages(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class ResizeDepth(DataTransformFn):
+    """Resize ``data["depth"]`` with aspect-preserving pad and rescale ``data["calibration"]`` intrinsics.
+
+    Keeps the focal lengths and principal point consistent with the padded image so the 3D
+    unprojection inside the model stays correct.
+    """
+
+    height: int
+    width: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        depth = data["depth"]
+        # Capture each camera's pre-resize shape before we overwrite it.
+        source_shapes = {k: v.shape[-3:-1] for k, v in depth.items()}
+        data["depth"] = {k: image_tools.resize_with_pad_depth(v, self.height, self.width) for k, v in depth.items()}
+
+        if "calibration" in data:
+            data["calibration"] = self._rescale_intrinsics(data["calibration"], source_shapes)
+        return data
+
+    def _rescale_intrinsics(self, calibration: dict, source_shapes: dict[str, tuple[int, int]]) -> dict:
+        out = dict(calibration)
+        for key, value in calibration.items():
+            if not key.endswith("_intrinsics"):
+                continue
+            cam = key[: -len("_intrinsics")]
+            depth_key = f"{cam}_0_depth"
+            if depth_key not in source_shapes:
+                continue
+            src_h, src_w = source_shapes[depth_key]
+            ratio = max(src_w / self.width, src_h / self.height)
+            resized_w = src_w / ratio
+            resized_h = src_h / ratio
+            pad_w = (self.width - resized_w) / 2
+            pad_h = (self.height - resized_h) / 2
+            out[key] = _scale_intrinsics(value, ratio, pad_w, pad_h)
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
 class SubsampleActions(DataTransformFn):
     stride: int
 
@@ -460,6 +500,19 @@ def make_bool_mask(*dims: int) -> tuple[bool, ...]:
         else:
             result.extend([False] * (-dim))
     return tuple(result)
+
+
+def _scale_intrinsics(intrinsics, ratio: float, pad_w: float, pad_h: float):
+    """Apply the ``resize_with_pad`` scale + centred pad to a 3x3 intrinsics matrix."""
+    if isinstance(intrinsics, torch.Tensor):
+        out = intrinsics.clone()
+    else:
+        out = np.asarray(intrinsics).copy()
+    out[..., 0, 0] = intrinsics[..., 0, 0] / ratio  # fx
+    out[..., 1, 1] = intrinsics[..., 1, 1] / ratio  # fy
+    out[..., 0, 2] = intrinsics[..., 0, 2] / ratio + pad_w  # cx
+    out[..., 1, 2] = intrinsics[..., 1, 2] / ratio + pad_h  # cy
+    return out
 
 
 def _assert_quantile_stats(norm_stats: at.PyTree[NormStats]) -> None:

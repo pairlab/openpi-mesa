@@ -161,13 +161,33 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, pos_encodings=None):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
         assert all(config.num_kv_heads == self.configs[0].num_kv_heads for config in self.configs)
 
         dtype = next(x.dtype for x in xs if x is not None)  # original dtype, could be half-precision
+
+        if pos_encodings is not None:
+            # Additive positional injection at the slots reserved for 3D tokens (positions == -1).
+            # Slots with positions >= 0 are handled by RoPE further down.
+            pos_mask = (positions == -1)[..., None]
+            lens = [x.shape[1] for x in xs if x is not None]
+            split_points = [sum(lens[: i + 1]) for i in range(len(lens) - 1)]
+            pos_mask_parts = jnp.split(pos_mask, split_points, axis=1) if split_points else [pos_mask]
+            mask_iter = iter(pos_mask_parts)
+            new_xs = []
+            for x, pe in zip(xs, pos_encodings, strict=True):
+                if x is None:
+                    new_xs.append(None)
+                    continue
+                mask = next(mask_iter)
+                if pe is None:
+                    new_xs.append(x)
+                else:
+                    new_xs.append(x + pe * mask.astype(x.dtype))
+            xs = new_xs
 
         qkvs = []
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
@@ -290,7 +310,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, pos_encodings=None):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -305,7 +325,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, pos_encodings)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -372,7 +392,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=pos_encodings
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -396,13 +417,16 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
+        pos_encodings: Sequence[at.Float[at.Array, "b _t _d"] | None] | None = None,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        embedded, kv_cache = self.layers(
+            embedded, kv_cache, positions, mask, adarms_cond, deterministic, pos_encodings
+        )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
@@ -422,7 +446,12 @@ class Module(nn.Module):
 
 
 def _apply_rope(x, *, positions, max_wavelength=10_000):
-    """Applies RoPE positions [B, L] to x [B, L, H, D]."""
+    """Applies RoPE positions [B, L] to x [B, L, H, D].
+
+    Positions equal to ``-1`` pass through unchanged; :class:`Pi0Adapt3R` uses that sentinel
+    on prefix image slots so the additive 3D pos-encoding can stand in for RoPE there.
+    """
+    valid_positions = positions != -1
     freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype=jnp.float32)
     timescale = max_wavelength**freq_exponents
     radians = positions[..., None] / timescale[None, None, :]
@@ -433,6 +462,8 @@ def _apply_rope(x, *, positions, max_wavelength=10_000):
     x1, x2 = jnp.split(x, 2, axis=-1)
     res = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
     assert res.dtype == jnp.float32
+    # Keep slots with positions == -1 untouched so additive spatial encodings dominate there.
+    res = jnp.where(valid_positions[..., None, None], res, x.astype(res.dtype))
     # The original bigvision impl allows RoPE to upcast to float32. It is then immediately downcast again to the cache
     # dtype when in inference mode (but not in training mode). I don't think any of this was intentional. Based on the
     # original DeepMind impl, as well as the widely-used transformers impl, it is ok to always downcast back to bfloat16

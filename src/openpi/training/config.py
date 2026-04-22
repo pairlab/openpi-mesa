@@ -14,6 +14,7 @@ from typing_extensions import override
 import tyro
 
 import openpi.models.model as _model
+import openpi.models.pi0_adapt3r as pi0_adapt3r
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
@@ -133,6 +134,20 @@ class ModelTransformFactory(GroupFactory):
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                )
+            case _model.ModelType.PI0_ADAPT3R:
+                assert isinstance(model_config, pi0_adapt3r.Pi0Adapt3RConfig)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeDepth(224, 224),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
@@ -577,6 +592,70 @@ class MESABimanualDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class MESABimanualAdapt3RDataConfig(DataConfigFactory):
+    """Like :class:`MESABimanualDataConfig`, but additionally pipes per-camera depth +
+    calibration + reference-arm pose through to the model so the 3D positional encoding
+    can be computed.
+
+    The LeRobot dataset built by ``examples/mesa/convert_mesa_data_to_lerobot.py`` with the
+    3D extensions exposes these extra features (per camera):
+      ``observation.depth.<cam>``     — float32 ``(1, H, W)``
+      ``observation.intrinsic.<cam>`` — float32 ``(3, 3)``
+      ``observation.extrinsic.<cam>`` — float32 ``(4, 4)``
+      ``observation.hand_mat.robot0`` — float32 ``(4, 4)`` end-effector pose used by ``eecf``.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.egocentric",
+                        "observation/wrist_image": "observation.images.robot0_eye_in_hand",
+                        "observation/wrist_image_right": "observation.images.robot1_eye_in_hand",
+                        "observation/depth_base": "observation.depth.egocentric",
+                        "observation/depth_left_wrist": "observation.depth.robot0_eye_in_hand",
+                        "observation/depth_right_wrist": "observation.depth.robot1_eye_in_hand",
+                        "observation/intrinsics_base": "observation.intrinsic.egocentric",
+                        "observation/intrinsics_left_wrist": "observation.intrinsic.robot0_eye_in_hand",
+                        "observation/intrinsics_right_wrist": "observation.intrinsic.robot1_eye_in_hand",
+                        "observation/extrinsics_base": "observation.extrinsic.egocentric",
+                        "observation/extrinsics_left_wrist": "observation.extrinsic.robot0_eye_in_hand",
+                        "observation/extrinsics_right_wrist": "observation.extrinsic.robot1_eye_in_hand",
+                        "observation/hand_mat_robot0": "observation.hand_mat.robot0",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        data_transforms = _transforms.Group(
+            inputs=[
+                mesa_policy.MESABimanualAdapt3RInputs(model_type=model_config.model_type),
+                _transforms.DeltaActions(delta_action_mask),
+            ],
+            outputs=[
+                _transforms.AbsoluteActions(delta_action_mask),
+                mesa_policy.MESAOutputs(action_dim=14),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -734,6 +813,44 @@ _CONFIGS = [
         ema_decay=None,
         batch_size=32,
         num_train_steps=25_000,
+    ),
+    # Same recipe as ``pi05_mesa_bimanual_lora`` but swaps SigLIP's learned 2D pos-embed for a
+    # per-patch 3D spatial encoding derived from depth + camera calibration (Adapt3R, resize /
+    # eecf / pos_insertion variant). Trains on a sibling dataset that carries the extra depth
+    # and calibration features.
+    TrainConfig(
+        name="pi05_mesa_bimanual_lora_3d",
+        model=pi0_adapt3r.Pi0Adapt3RConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=MESABimanualAdapt3RDataConfig(
+            repo_id="fchang40/mesa_bimanual_2task_3d",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa_bimanual_2task_3d"),
+        ),
+        # The 3D positional head (pos_embed_l1/l2, pos_insertion_scale) is absent from pi05_base
+        # and must be initialized fresh — whitelist it so the checkpoint-structure check passes.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            extra_missing_regex=r".*(pos_embed_l1|pos_embed_l2|pos_insertion_scale).*",
+        ),
+        freeze_filter=pi0_adapt3r.Pi0Adapt3RConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=30_000,
     ),
     TrainConfig(
         name="pi0_fast_mesa_70",

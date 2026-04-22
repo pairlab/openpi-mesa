@@ -56,3 +56,42 @@ def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: in
     zero_image.paste(resized_image, (pad_width, pad_height))
     assert zero_image.size == (width, height)
     return zero_image
+
+
+def resize_with_pad_depth(images: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Resize float32 depth images with aspect-preserving pad, mirroring ``resize_with_pad``.
+
+    Uses scipy-free nearest-neighbour sampling on the raw float32 data so metric depth values
+    are preserved (PIL's uint8 path would lose precision). Input shape ``(..., H, W, 1)``;
+    output shape ``(..., height, width, 1)``.
+    """
+    if images.shape[-3:-1] == (height, width):
+        return images
+
+    original_shape = images.shape
+    flat = images.reshape(-1, *original_shape[-3:])
+    resized = np.stack([_resize_with_pad_depth_nearest(im, height, width) for im in flat])
+    return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
+
+
+def _resize_with_pad_depth_nearest(depth: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Nearest-neighbour resize + centred zero pad for a single ``(H, W, 1)`` depth image."""
+    depth_2d = depth.squeeze(axis=-1).astype(np.float32, copy=False)
+    cur_h, cur_w = depth_2d.shape
+    if (cur_h, cur_w) == (height, width):
+        return depth_2d[..., None]
+
+    ratio = max(cur_w / width, cur_h / height)
+    resized_h = int(cur_h / ratio)
+    resized_w = int(cur_w / ratio)
+
+    # Nearest-neighbour via integer index arithmetic (preserves exact depth values).
+    row_idx = (np.arange(resized_h) * (cur_h / resized_h)).astype(np.int64).clip(0, cur_h - 1)
+    col_idx = (np.arange(resized_w) * (cur_w / resized_w)).astype(np.int64).clip(0, cur_w - 1)
+    resized = depth_2d[row_idx[:, None], col_idx[None, :]]
+
+    padded = np.zeros((height, width), dtype=np.float32)
+    pad_h = max(0, (height - resized_h) // 2)
+    pad_w = max(0, (width - resized_w) // 2)
+    padded[pad_h : pad_h + resized_h, pad_w : pad_w + resized_w] = resized
+    return padded[..., None]

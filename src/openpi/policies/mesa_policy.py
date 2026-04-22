@@ -110,6 +110,52 @@ class MESABimanualInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class MESABimanualAdapt3RInputs(transforms.DataTransformFn):
+    """Bimanual Mesa inputs for the 3D-positional Pi0Adapt3R model.
+
+    Extends :class:`MESABimanualInputs` with per-camera depth + calibration (intrinsics,
+    extrinsics) and the reference-arm pose pair used to transform the point cloud into
+    the end-effector frame. ``hand_mat_inv`` is computed here to keep the LeRobot dataset
+    footprint minimal.
+    """
+
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        inputs = MESABimanualInputs(model_type=self.model_type)(data)
+
+        inputs["depth"] = {
+            "base_0_depth": _parse_depth(data["observation/depth_base"]),
+            "left_wrist_0_depth": _parse_depth(data["observation/depth_left_wrist"]),
+            "right_wrist_0_depth": _parse_depth(data["observation/depth_right_wrist"]),
+        }
+
+        hand_mat = np.asarray(data["observation/hand_mat_robot0"], dtype=np.float32)
+        inputs["calibration"] = {
+            "base_intrinsics": np.asarray(data["observation/intrinsics_base"], dtype=np.float32),
+            "base_extrinsics": np.asarray(data["observation/extrinsics_base"], dtype=np.float32),
+            "left_wrist_intrinsics": np.asarray(data["observation/intrinsics_left_wrist"], dtype=np.float32),
+            "left_wrist_extrinsics": np.asarray(data["observation/extrinsics_left_wrist"], dtype=np.float32),
+            "right_wrist_intrinsics": np.asarray(data["observation/intrinsics_right_wrist"], dtype=np.float32),
+            "right_wrist_extrinsics": np.asarray(data["observation/extrinsics_right_wrist"], dtype=np.float32),
+            "hand_mat": hand_mat,
+            "hand_mat_inv": np.linalg.inv(hand_mat).astype(np.float32),
+        }
+        return inputs
+
+
+def _parse_depth(depth: np.ndarray) -> np.ndarray:
+    """Normalize a stored depth array to ``(H, W, 1)`` float32 (undo LeRobot's CHW layout)."""
+    depth = np.asarray(depth, dtype=np.float32)
+    # Stored as (1, H, W); transpose to (H, W, 1) to match the RGB HWC convention used downstream.
+    if depth.ndim == 3 and depth.shape[0] == 1:
+        depth = np.transpose(depth, (1, 2, 0))
+    elif depth.ndim == 2:
+        depth = depth[..., None]
+    return depth
+
+
+@dataclasses.dataclass(frozen=True)
 class MESAOutputs(transforms.DataTransformFn):
     """
     This class is used to convert outputs from the model back the the dataset specific format. It is

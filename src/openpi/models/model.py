@@ -33,6 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    PI0_ADAPT3R = "pi0_adapt3r"
 
 
 # The model always expects these images
@@ -136,6 +137,98 @@ class Observation(Generic[ArrayT]):
         return result
 
 
+@at.typecheck
+@struct.dataclass
+class DepthObservation(Observation):
+    """Observation carrying per-camera depth images and calibration.
+
+    ``calibration`` is a flat dict mixing 3x3 intrinsics and 4x4 extrinsics (plus the
+    end-effector pose used by ``pc_frame="eecf"``); entries are keyed by
+    :mod:`openpi.training.key_utils`.
+    """
+
+    depth_images: dict[str, at.Float[ArrayT, "*b h w 1"]] | None = None
+    calibration: dict[str, at.Float[ArrayT, "*b 3 3"] | at.Float[ArrayT, "*b 4 4"]] | None = None
+
+    @classmethod
+    def from_dict(cls, data: at.PyTree[ArrayT]) -> "DepthObservation[ArrayT]":
+        if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
+            raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        for key in data["image"]:
+            if data["image"][key].dtype == np.uint8:
+                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
+            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
+                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        return cls(
+            images=data["image"],
+            image_masks=data["image_mask"],
+            depth_images=data["depth"],
+            calibration=data["calibration"],
+            state=data["state"],
+            tokenized_prompt=data.get("tokenized_prompt"),
+            tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            token_ar_mask=data.get("token_ar_mask"),
+            token_loss_mask=data.get("token_loss_mask"),
+        )
+
+    def to_dict(self) -> at.PyTree[ArrayT]:
+        result = dataclasses.asdict(self)
+        result["image"] = result.pop("images")
+        result["image_mask"] = result.pop("image_masks")
+        result["depth"] = result.pop("depth_images")
+        return result
+
+
+@at.typecheck
+@struct.dataclass
+class PointCloudObservation(Observation):
+    """Observation carrying per-camera point clouds (post depth unprojection)."""
+
+    point_clouds: dict[str, at.Float[ArrayT, "*b h w 3"]] | None = None
+    calibration: dict[str, at.Float[ArrayT, "*b 3 3"] | at.Float[ArrayT, "*b 4 4"]] | None = None
+
+    @classmethod
+    def from_dict(cls, data: at.PyTree[ArrayT]) -> "PointCloudObservation[ArrayT]":
+        if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
+            raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        for key in data["image"]:
+            if data["image"][key].dtype == np.uint8:
+                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
+            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
+                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        return cls(
+            images=data["image"],
+            image_masks=data["image_mask"],
+            point_clouds=data["point_clouds"],
+            calibration=data.get("calibration"),
+            state=data["state"],
+            tokenized_prompt=data.get("tokenized_prompt"),
+            tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            token_ar_mask=data.get("token_ar_mask"),
+            token_loss_mask=data.get("token_loss_mask"),
+        )
+
+    def to_dict(self) -> at.PyTree[ArrayT]:
+        result = dataclasses.asdict(self)
+        result["image"] = result.pop("images")
+        result["image_mask"] = result.pop("image_masks")
+        return result
+
+
+def observation_from_dict(data: at.PyTree) -> Observation:
+    """Pick the right ``Observation`` subclass from the keys present in ``data``.
+
+    3D-positional pipelines add ``depth`` + ``calibration`` (and ``point_clouds`` once the
+    depth lift happens upstream of the model). Plain pi0/pi0.5 pipelines have neither.
+    Used by both training (per-batch) and inference (per-call) so the two paths agree.
+    """
+    if "point_clouds" in data:
+        return PointCloudObservation.from_dict(data)
+    if "depth" in data:
+        return DepthObservation.from_dict(data)
+    return Observation.from_dict(data)
+
+
 # Defines the format of the actions. This field is included as "actions" inside the dictionary
 # produced by the data transforms.
 Actions = at.Float[ArrayT, "*b ah ad"]
@@ -151,25 +244,35 @@ def preprocess_observation(
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
+
+    For :class:`PointCloudObservation`, the same geometric augmentations applied to non-wrist
+    RGB inputs are also applied to the matching point-cloud entries (with the color jitter
+    dropped) so the two stay aligned. :class:`DepthObservation` depth/calibration are passed
+    through unchanged; lifting to a point cloud happens in the model.
     """
 
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
+    # Imported lazily to avoid a circular import.
+    from openpi.training import key_utils as _key_utils
+
     batch_shape = observation.state.shape[:-1]
+    is_point_cloud = isinstance(observation, PointCloudObservation)
 
     out_images = {}
+    out_point_clouds: dict = {}
     for key in image_keys:
         image = observation.images[key]
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
 
+        transforms = []
+        sub_rngs = None
         if train:
             # Convert from [-1, 1] to [0, 1] for augmax.
             image = image / 2.0 + 0.5
-
-            transforms = []
             if "wrist" not in key:
                 height, width = image.shape[1:3]
                 transforms += [
@@ -182,11 +285,22 @@ def preprocess_observation(
             ]
             sub_rngs = jax.random.split(rng, image.shape[0])
             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
-
             # Back to [-1, 1].
             image = image * 2.0 - 1.0
 
         out_images[key] = image
+
+        if is_point_cloud:
+            pc_key = _key_utils.get_point_cloud_key(_key_utils.get_camera_name(key))
+            pc = observation.point_clouds.get(pc_key) if observation.point_clouds is not None else None
+            if pc is not None:
+                # Reuse the non-colour geometric transforms + the same per-sample rngs so the
+                # point cloud stays pixel-aligned with the augmented image.
+                if train and "wrist" not in key:
+                    geom_transforms = transforms[:-1]  # drop ColorJitter
+                    pcd_chain = augmax.Chain(*geom_transforms)
+                    pc = jax.vmap(lambda r, x: pcd_chain(r, x, input_types=augmax.InputType.MASK))(sub_rngs, pc)
+                out_point_clouds[pc_key] = pc
 
     # obtain mask
     out_masks = {}
@@ -197,6 +311,30 @@ def preprocess_observation(
         else:
             out_masks[key] = jnp.asarray(observation.image_masks[key])
 
+    if isinstance(observation, PointCloudObservation):
+        return PointCloudObservation(
+            images=out_images,
+            image_masks=out_masks,
+            point_clouds=out_point_clouds,
+            calibration=observation.calibration,
+            state=observation.state,
+            tokenized_prompt=observation.tokenized_prompt,
+            tokenized_prompt_mask=observation.tokenized_prompt_mask,
+            token_ar_mask=observation.token_ar_mask,
+            token_loss_mask=observation.token_loss_mask,
+        )
+    if isinstance(observation, DepthObservation):
+        return DepthObservation(
+            images=out_images,
+            image_masks=out_masks,
+            depth_images=observation.depth_images,
+            calibration=observation.calibration,
+            state=observation.state,
+            tokenized_prompt=observation.tokenized_prompt,
+            tokenized_prompt_mask=observation.tokenized_prompt_mask,
+            token_ar_mask=observation.token_ar_mask,
+            token_loss_mask=observation.token_loss_mask,
+        )
     return Observation(
         images=out_images,
         image_masks=out_masks,

@@ -43,15 +43,22 @@ class CheckpointWeightLoader(WeightLoader):
         example: "./checkpoints/<config>/<exp>/<step>/params"
       released checkpoints:
         example: "gs://openpi-assets/checkpoints/<model>/params"
+
+    ``extra_missing_regex`` lets a caller keep additional fresh-init params that aren't present
+    in the checkpoint (e.g. the 3D-positional head in :class:`~openpi.models.pi0_adapt3r.Pi0Adapt3R`).
+    The pattern is OR'd with the default ``.*lora.*`` via a non-capturing alternation.
     """
 
     params_path: str
+    extra_missing_regex: str | None = None
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        missing_regex = ".*lora.*"
+        if self.extra_missing_regex:
+            missing_regex = f"(?:{missing_regex})|(?:{self.extra_missing_regex})"
+        return _merge_params(loaded_params, params, missing_regex=missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)
