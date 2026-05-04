@@ -105,9 +105,12 @@ def find_free_port() -> int:
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint-dir", required=True,
-                        help="pi05 checkpoint step dir (e.g. .../9000).")
+                        help="Checkpoint dir to load.")
     parser.add_argument("--config", default="pi05_mesa_bimanual_lora",
-                        help="openpi TrainConfig name.")
+                        help="openpi TrainConfig name (ignored when --server-script is set).")
+    parser.add_argument("--server-script", default=None,
+                        help="Path to a custom policy server script (relative to repo root). "
+                             "If set, replaces eval_policy_server.py and --config is not passed.")
 
     parser.add_argument("--exp-name", required=True)
     parser.add_argument("--variant-name", required=True)
@@ -146,12 +149,20 @@ async def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_dir = os.path.dirname(os.path.dirname(script_dir))
 
-    serve_cmd = [
-        sys.executable, os.path.join(script_dir, "eval_policy_server.py"),
-        "--config", args.config,
-        "--checkpoint-dir", args.checkpoint_dir,
-        "--port", str(port),
-    ]
+    if args.server_script:
+        server_script = os.path.join(repo_dir, args.server_script)
+        serve_cmd = [
+            sys.executable, server_script,
+            "--checkpoint-dir", args.checkpoint_dir,
+            "--port", str(port),
+        ]
+    else:
+        serve_cmd = [
+            sys.executable, os.path.join(script_dir, "eval_policy_server.py"),
+            "--config", args.config,
+            "--checkpoint-dir", args.checkpoint_dir,
+            "--port", str(port),
+        ]
 
     eval_cmd = [
         os.path.join(script_dir, "run-vla-benchmark.sh"),
