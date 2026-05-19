@@ -144,6 +144,61 @@ class MESABimanualAdapt3RInputs(transforms.DataTransformFn):
         return inputs
 
 
+@dataclasses.dataclass(frozen=True)
+class MESABimanualAdapt3RMultiCamInputs(transforms.DataTransformFn):
+    """N-camera bimanual Mesa inputs for Pi0Adapt3R.
+
+    Generalizes :class:`MESABimanualAdapt3RInputs` to arbitrary camera sets. Each entry in
+    ``cameras`` names one camera whose LeRobot features have been repacked to keys of the
+    form ``observation/{image,depth,intrinsics,extrinsics}_{cam}``; the transform emits
+    model-side entries ``{cam}_0_rgb``, ``{cam}_0_depth``, ``{cam}_intrinsics``,
+    ``{cam}_extrinsics``. The reference arm for ``hand_mat`` is selectable via ``ref_arm``.
+    """
+
+    model_type: _model.ModelType
+    cameras: tuple[str, ...]
+    ref_arm: int = 0
+
+    def __call__(self, data: dict) -> dict:
+        if not self.cameras:
+            raise ValueError("MESABimanualAdapt3RMultiCamInputs.cameras must be non-empty.")
+
+        image_dict: dict[str, np.ndarray] = {}
+        mask_dict: dict[str, np.bool_] = {}
+        depth_dict: dict[str, np.ndarray] = {}
+        calibration: dict[str, np.ndarray] = {}
+
+        for cam in self.cameras:
+            image_dict[f"{cam}_0_rgb"] = _parse_image(data[f"observation/image_{cam}"])
+            mask_dict[f"{cam}_0_rgb"] = np.True_
+            depth_dict[f"{cam}_0_depth"] = _parse_depth(data[f"observation/depth_{cam}"])
+            calibration[f"{cam}_intrinsics"] = np.asarray(
+                data[f"observation/intrinsics_{cam}"], dtype=np.float32
+            )
+            calibration[f"{cam}_extrinsics"] = np.asarray(
+                data[f"observation/extrinsics_{cam}"], dtype=np.float32
+            )
+
+        hand_mat = np.asarray(data[f"observation/hand_mat_robot{self.ref_arm}"], dtype=np.float32)
+        calibration["hand_mat"] = hand_mat
+        calibration["hand_mat_inv"] = np.linalg.inv(hand_mat).astype(np.float32)
+
+        inputs = {
+            "state": data["observation/state"],
+            "image": image_dict,
+            "image_mask": mask_dict,
+            "depth": depth_dict,
+            "calibration": calibration,
+        }
+
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
 def _parse_depth(depth: np.ndarray) -> np.ndarray:
     """Normalize a stored depth array to ``(H, W, 1)`` float32 (undo LeRobot's CHW layout)."""
     depth = np.asarray(depth, dtype=np.float32)

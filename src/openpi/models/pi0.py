@@ -44,6 +44,38 @@ def make_attn_mask(input_mask, mask_ar):
     return jnp.logical_and(attn_mask, valid_mask)
 
 
+def drop_one_camera_per_sample(
+    rng: at.KeyArrayLike,
+    image_masks: dict[str, at.Bool[at.Array, "*b"]],
+    drop_prob: float,
+) -> dict[str, at.Bool[at.Array, "*b"]]:
+    """Per batch element: with probability ``drop_prob``, flip exactly one uniformly-chosen
+    camera's ``image_masks`` entry to ``False``.
+
+    Returns a new dict with the same keys and shapes; the input is not mutated. At most one
+    camera is dropped per sample, so callers are guaranteed ``len(cameras) - 1`` valid views
+    in the worst case. Shapes are preserved, so the caller can substitute the result into an
+    ``Observation`` via ``replace(image_masks=...)`` without triggering recompilation.
+    """
+    cam_keys = list(image_masks.keys())
+    n_cams = len(cam_keys)
+    if n_cams < 2:
+        return dict(image_masks)
+
+    any_mask = next(iter(image_masks.values()))
+    batch_shape = any_mask.shape
+
+    drop_rng, cam_rng = jax.random.split(rng)
+    should_drop = jax.random.uniform(drop_rng, batch_shape) < drop_prob
+    drop_idx = jax.random.randint(cam_rng, batch_shape, 0, n_cams)
+
+    out: dict[str, at.Bool[at.Array, "*b"]] = {}
+    for i, key in enumerate(cam_keys):
+        drop_this_cam = should_drop & (drop_idx == i)
+        out[key] = jnp.where(drop_this_cam, jnp.zeros_like(image_masks[key]), image_masks[key])
+    return out
+
+
 @at.typecheck
 def posemb_sincos(
     pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
@@ -98,6 +130,9 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        self.camera_keys = config.resolved_camera_keys
+        self.camera_drop_prob = float(config.camera_drop_prob)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -189,8 +224,15 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        preprocess_rng, dropout_rng, noise_rng, time_rng = jax.random.split(rng, 4)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, image_keys=self.camera_keys
+        )
+        if train and self.camera_drop_prob > 0.0 and len(observation.image_masks) > 1:
+            new_masks = drop_one_camera_per_sample(
+                dropout_rng, observation.image_masks, self.camera_drop_prob
+            )
+            observation = observation.replace(image_masks=new_masks)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -222,7 +264,7 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
-        observation = _model.preprocess_observation(None, observation, train=False)
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=self.camera_keys)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps

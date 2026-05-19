@@ -32,11 +32,28 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Which image slots the observation carries. ``None`` preserves the historical 3-camera
+    # default (:attr:`openpi.models.model.IMAGE_KEYS`); setting this lets a training config
+    # wire in N-camera datasets (e.g. the Mesa 4-cam bimanual setup) without subclassing.
+    camera_keys: tuple[str, ...] | None = None
+    # Per-sample, attention-mask only camera dropout. With this probability, one uniformly
+    # chosen camera's ``image_masks`` entry is flipped to ``False`` for that sample during
+    # ``compute_loss(train=True)``. At most one camera is dropped per sample, so callers are
+    # guaranteed ``len(camera_keys) - 1`` valid views. Inference (``sample_actions``) is
+    # unaffected. FLOP-neutral: SigLIP still processes every camera.
+    camera_drop_prob: float = 0.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if not 0.0 <= self.camera_drop_prob <= 1.0:
+            raise ValueError(f"camera_drop_prob must be in [0, 1], got {self.camera_drop_prob!r}.")
+
+    @property
+    def resolved_camera_keys(self) -> tuple[str, ...]:
+        return tuple(self.camera_keys) if self.camera_keys is not None else tuple(_model.IMAGE_KEYS)
 
     @property
     @override
@@ -55,19 +72,12 @@ class Pi0Config(_model.BaseModelConfig):
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+        camera_keys = self.resolved_camera_keys
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images={k: image_spec for k in camera_keys},
+                image_masks={k: image_mask_spec for k in camera_keys},
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),

@@ -656,6 +656,67 @@ class MESABimanualAdapt3RDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class MESABimanualAdapt3RMultiCamDataConfig(DataConfigFactory):
+    """N-camera variant of :class:`MESABimanualAdapt3RDataConfig`.
+
+    ``cameras`` lists the LeRobot camera names present in the source dataset (in prefix
+    order); both the repack mapping and the downstream Adapt3R transform scale with it. The
+    resulting model observation uses ``{cam}_0_rgb``/``{cam}_0_depth``/... keys so the
+    camera identifiers survive end-to-end.
+    """
+
+    cameras: tuple[str, ...] = ()
+    ref_arm: int = 0
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not self.cameras:
+            raise ValueError("MESABimanualAdapt3RMultiCamDataConfig.cameras must be non-empty.")
+
+        mapping: dict[str, str] = {
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+            f"observation/hand_mat_robot{self.ref_arm}": f"observation.hand_mat.robot{self.ref_arm}",
+        }
+        for cam in self.cameras:
+            mapping[f"observation/image_{cam}"] = f"observation.images.{cam}"
+            mapping[f"observation/depth_{cam}"] = f"observation.depth.{cam}"
+            mapping[f"observation/intrinsics_{cam}"] = f"observation.intrinsic.{cam}"
+            mapping[f"observation/extrinsics_{cam}"] = f"observation.extrinsic.{cam}"
+
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(mapping)],
+        )
+
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        data_transforms = _transforms.Group(
+            inputs=[
+                mesa_policy.MESABimanualAdapt3RMultiCamInputs(
+                    model_type=model_config.model_type,
+                    cameras=tuple(self.cameras),
+                    ref_arm=self.ref_arm,
+                ),
+                _transforms.DeltaActions(delta_action_mask),
+            ],
+            outputs=[
+                _transforms.AbsoluteActions(delta_action_mask),
+                mesa_policy.MESAOutputs(action_dim=14),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -842,6 +903,135 @@ _CONFIGS = [
             extra_missing_regex=r".*(pos_embed_l1|pos_embed_l2|pos_insertion_scale).*",
         ),
         freeze_filter=pi0_adapt3r.Pi0Adapt3RConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=30_000,
+    ),
+    # 4-camera MimicGen-generated variant of ``pi05_mesa_bimanual_lora_3d``.
+    # Source: /storage/project/r-agarg35-0/shared/vla_benchmark_data/apr_23/gen_data/
+    # (2 tasks × 200 demos, egocentric + {left,mid,right}shoulder cameras).
+    TrainConfig(
+        name="pi05_mesa_bimanual_lora_3d_gen",
+        model=pi0_adapt3r.Pi0Adapt3RConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            camera_keys=(
+                "egocentric_0_rgb",
+                "leftshoulder_0_rgb",
+                "rightshoulder_0_rgb",
+                "midshoulder_0_rgb",
+            ),
+        ),
+        data=MESABimanualAdapt3RMultiCamDataConfig(
+            repo_id="mesa_bimanual_gen_2task_3d",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa_bimanual_gen_2task_3d"),
+            cameras=("egocentric", "leftshoulder", "rightshoulder", "midshoulder"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            extra_missing_regex=r".*(pos_embed_l1|pos_embed_l2|pos_insertion_scale).*",
+        ),
+        freeze_filter=pi0_adapt3r.Pi0Adapt3RConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=30_000,
+    ),
+    # Same recipe as ``pi05_mesa_bimanual_lora_3d_gen`` plus per-sample camera dropout:
+    # each training step, each batch element independently has a 25% chance of having one
+    # uniformly-chosen camera masked out, so the model always sees at least 3 of 4 views
+    # but learns to be robust to a single camera being unavailable. Attention-mask only —
+    # no FLOP change vs. the base 4-cam config.
+    TrainConfig(
+        name="pi05_mesa_bimanual_lora_3d_gen_camdrop",
+        model=pi0_adapt3r.Pi0Adapt3RConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            camera_keys=(
+                "egocentric_0_rgb",
+                "leftshoulder_0_rgb",
+                "rightshoulder_0_rgb",
+                "midshoulder_0_rgb",
+            ),
+            camera_drop_prob=0.25,
+        ),
+        data=MESABimanualAdapt3RMultiCamDataConfig(
+            repo_id="mesa_bimanual_gen_2task_3d",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa_bimanual_gen_2task_3d"),
+            cameras=("egocentric", "leftshoulder", "rightshoulder", "midshoulder"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            extra_missing_regex=r".*(pos_embed_l1|pos_embed_l2|pos_insertion_scale).*",
+        ),
+        freeze_filter=pi0_adapt3r.Pi0Adapt3RConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=30_000,
+    ),
+    # 2D-backbone counterpart to ``pi05_mesa_bimanual_lora_3d_gen_camdrop``: same 4-cam Mesa
+    # MimicGen dataset, same camera-dropout recipe (p=0.25, at-most-one drop), but plain
+    # pi0.5 LoRA (no Adapt3R 3D positional head). The data pipeline still ships depth +
+    # calibration (reusing the 3D repo); the 2D model just ignores those fields, which keeps
+    # training config reuse tight without a parallel 2D-only data path.
+    TrainConfig(
+        name="pi05_mesa_bimanual_lora_2d_gen_camdrop",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            camera_keys=(
+                "egocentric_0_rgb",
+                "leftshoulder_0_rgb",
+                "rightshoulder_0_rgb",
+                "midshoulder_0_rgb",
+            ),
+            camera_drop_prob=0.25,
+        ),
+        data=MESABimanualAdapt3RMultiCamDataConfig(
+            repo_id="mesa_bimanual_gen_2task_3d",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa_bimanual_gen_2task_3d"),
+            cameras=("egocentric", "leftshoulder", "rightshoulder", "midshoulder"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=20,
             max_token_len=80,

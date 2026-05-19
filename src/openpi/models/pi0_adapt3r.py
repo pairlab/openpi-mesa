@@ -20,7 +20,7 @@ from typing_extensions import Literal, override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models.adapt3r_nnx_modules import HarmonicEncoding
-from openpi.models.pi0 import Pi0, make_attn_mask
+from openpi.models.pi0 import Pi0, drop_one_camera_per_sample, make_attn_mask
 from openpi.models.utils import point_cloud_utils as _pcu
 from openpi.shared import array_typing as at
 from openpi.training import key_utils as _key_utils
@@ -35,6 +35,9 @@ class Pi0Adapt3RConfig(pi0_config.Pi0Config):
     Inherits every Pi0 knob (``pi05``, LoRA variants, action dims, token length, etc.).
     The 3D head parameters live outside the LoRA scope and will train freely under the
     standard Pi0 LoRA freeze filter.
+
+    ``camera_keys`` and ``camera_drop_prob`` are inherited from :class:`Pi0Config`; the point
+    cloud stack here scales with ``resolved_camera_keys`` the same way the RGB prefix does.
     """
 
     enc_mode: Literal["resize"] = "resize"
@@ -60,14 +63,15 @@ class Pi0Adapt3RConfig(pi0_config.Pi0Config):
         intrinsics_spec = jax.ShapeDtypeStruct([batch_size, 3, 3], jnp.float32)
         extrinsics_spec = jax.ShapeDtypeStruct([batch_size, 4, 4], jnp.float32)
 
+        camera_keys = self.resolved_camera_keys
         with at.disable_typechecking():
             observation_spec = _model.DepthObservation(
-                images={k: image_spec for k in _model.IMAGE_KEYS},
-                image_masks={k: image_mask_spec for k in _model.IMAGE_KEYS},
-                depth_images={_key_utils.get_depth_key(_camera_name(k)): depth_spec for k in _model.IMAGE_KEYS},
+                images={k: image_spec for k in camera_keys},
+                image_masks={k: image_mask_spec for k in camera_keys},
+                depth_images={_key_utils.get_depth_key(_camera_name(k)): depth_spec for k in camera_keys},
                 calibration={
-                    **{_key_utils.get_intrinsics_key(_camera_name(k)): intrinsics_spec for k in _model.IMAGE_KEYS},
-                    **{_key_utils.get_extrinsics_key(_camera_name(k)): extrinsics_spec for k in _model.IMAGE_KEYS},
+                    **{_key_utils.get_intrinsics_key(_camera_name(k)): intrinsics_spec for k in camera_keys},
+                    **{_key_utils.get_extrinsics_key(_camera_name(k)): extrinsics_spec for k in camera_keys},
                     "hand_mat": extrinsics_spec,
                     "hand_mat_inv": extrinsics_spec,
                 },
@@ -116,7 +120,7 @@ class Pi0Adapt3R(Pi0):
         self.pos_embed_l2 = nnx.Linear(hidden_dim, pe_dim, rngs=rngs)
         self.pos_insertion_scale = nnx.Param(jnp.array(config.pos_insertion_scale))
 
-        self.num_image_patches = len(_model.IMAGE_KEYS) * _PATCHES_PER_CAMERA
+        self.num_image_patches = len(config.resolved_camera_keys) * _PATCHES_PER_CAMERA
 
     def add_point_clouds_and_preprocess(
         self, observation: _model.DepthObservation, rng: at.KeyArrayLike | None, *, train: bool = False
@@ -175,8 +179,14 @@ class Pi0Adapt3R(Pi0):
         *,
         train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, dropout_rng, noise_rng, time_rng = jax.random.split(rng, 4)
         observation = self.add_point_clouds_and_preprocess(observation, preprocess_rng, train=train)
+
+        if train and self.camera_drop_prob > 0.0 and len(observation.image_masks) > 1:
+            new_masks = drop_one_camera_per_sample(
+                dropout_rng, observation.image_masks, self.camera_drop_prob
+            )
+            observation = observation.replace(image_masks=new_masks)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
