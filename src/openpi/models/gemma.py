@@ -161,33 +161,13 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache, pos_encodings=None):
+    def __call__(self, xs, positions, attn_mask, kv_cache, xyz_positions=None):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
         assert all(config.num_kv_heads == self.configs[0].num_kv_heads for config in self.configs)
 
         dtype = next(x.dtype for x in xs if x is not None)  # original dtype, could be half-precision
-
-        if pos_encodings is not None:
-            # Additive positional injection at the slots reserved for 3D tokens (positions == -1).
-            # Slots with positions >= 0 are handled by RoPE further down.
-            pos_mask = (positions == -1)[..., None]
-            lens = [x.shape[1] for x in xs if x is not None]
-            split_points = [sum(lens[: i + 1]) for i in range(len(lens) - 1)]
-            pos_mask_parts = jnp.split(pos_mask, split_points, axis=1) if split_points else [pos_mask]
-            mask_iter = iter(pos_mask_parts)
-            new_xs = []
-            for x, pe in zip(xs, pos_encodings, strict=True):
-                if x is None:
-                    new_xs.append(None)
-                    continue
-                mask = next(mask_iter)
-                if pe is None:
-                    new_xs.append(x)
-                else:
-                    new_xs.append(x + pe * mask.astype(x.dtype))
-            xs = new_xs
 
         qkvs = []
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
@@ -220,10 +200,10 @@ class Attention(nn.Module):
 
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
 
-        q = _apply_rope(q, positions=positions)
+        q = _apply_rope(q, positions=positions, xyz_positions=xyz_positions)
         q *= self.configs[0].head_dim ** -0.5
 
-        k = _apply_rope(k, positions=positions)
+        k = _apply_rope(k, positions=positions, xyz_positions=xyz_positions)
 
         # should still be half-precision here (if input was half-precision)
         assert q.dtype == k.dtype == v.dtype == dtype
@@ -310,7 +290,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, pos_encodings=None):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, xyz_positions=None):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -325,7 +305,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, pos_encodings)
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, xyz_positions)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -393,7 +373,7 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=pos_encodings
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=xyz_positions
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -417,7 +397,7 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-        pos_encodings: Sequence[at.Float[at.Array, "b _t _d"] | None] | None = None,
+        xyz_positions: at.Float[at.Array, "b t 3"] | None = None,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
@@ -425,7 +405,7 @@ class Module(nn.Module):
             adarms_cond = [None] * len(self.configs)
 
         embedded, kv_cache = self.layers(
-            embedded, kv_cache, positions, mask, adarms_cond, deterministic, pos_encodings
+            embedded, kv_cache, positions, mask, adarms_cond, deterministic, xyz_positions
         )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
@@ -445,29 +425,52 @@ class Module(nn.Module):
         )
 
 
-def _apply_rope(x, *, positions, max_wavelength=10_000):
-    """Applies RoPE positions [B, L] to x [B, L, H, D].
+def _apply_rope(x, *, positions, xyz_positions=None, max_wavelength=10_000):
+    """Hybrid RoPE: 1D Llama RoPE on slots with ``positions >= 0``, 3D RoPE on slots
+    with ``positions == -1`` when ``xyz_positions`` is provided.
 
-    Positions equal to ``-1`` pass through unchanged; :class:`Pi0Adapt3R` uses that sentinel
-    on prefix image slots so the additive 3D pos-encoding can stand in for RoPE there.
+    The 3D path splits the per-head frequency budget into three near-equal chunks (one per
+    spatial axis) so a single token rotation factors as ``R_x(x) ⊕ R_y(y) ⊕ R_z(z)``. Two
+    tokens rotated by the same scheme yield ``Q · K = Q_raw · R_3D(xyz_k - xyz_q) · K_raw``,
+    giving attention a true relative-position bias over xyz.
+
+    When ``xyz_positions`` is ``None``, slots with ``positions == -1`` pass through
+    unchanged (legacy behaviour for callers that do not opt into 3D RoPE).
     """
-    valid_positions = positions != -1
-    freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype=jnp.float32)
+    head_dim = x.shape[-1]
+    half_dim = head_dim // 2
+    freq_exponents = (2.0 / head_dim) * jnp.arange(half_dim, dtype=jnp.float32)
     timescale = max_wavelength**freq_exponents
-    radians = positions[..., None] / timescale[None, None, :]
+    radians_1d = positions[..., None].astype(jnp.float32) / timescale[None, None, :]
+
+    valid_positions = positions != -1
+    if xyz_positions is not None:
+        c1 = half_dim // 3
+        c2 = half_dim // 3
+        ts_x = timescale[:c1]
+        ts_y = timescale[c1 : c1 + c2]
+        ts_z = timescale[c1 + c2 :]
+        radians_3d = jnp.concatenate(
+            [
+                xyz_positions[..., 0:1] / ts_x[None, None, :],
+                xyz_positions[..., 1:2] / ts_y[None, None, :],
+                xyz_positions[..., 2:3] / ts_z[None, None, :],
+            ],
+            axis=-1,
+        )
+        radians = jnp.where(valid_positions[..., None], radians_1d, radians_3d)
+    else:
+        radians = radians_1d
+
     radians = radians[..., None, :]
     assert radians.dtype == jnp.float32
-    # radians.shape = [...,L,1,d=D/2]
     sin, cos = jnp.sin(radians), jnp.cos(radians)
     x1, x2 = jnp.split(x, 2, axis=-1)
     res = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
     assert res.dtype == jnp.float32
-    # Keep slots with positions == -1 untouched so additive spatial encodings dominate there.
-    res = jnp.where(valid_positions[..., None, None], res, x.astype(res.dtype))
-    # The original bigvision impl allows RoPE to upcast to float32. It is then immediately downcast again to the cache
-    # dtype when in inference mode (but not in training mode). I don't think any of this was intentional. Based on the
-    # original DeepMind impl, as well as the widely-used transformers impl, it is ok to always downcast back to bfloat16
-    # here.
+
+    if xyz_positions is None:
+        res = jnp.where(valid_positions[..., None, None], res, x.astype(res.dtype))
     return res.astype(x.dtype)
 
 

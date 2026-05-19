@@ -141,7 +141,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
-            case _model.ModelType.PI0_ADAPT3R:
+            case _model.ModelType.PI0_ADAPT3R | _model.ModelType.PI0_ADAPT3R_BIMANUAL:
                 assert isinstance(model_config, pi0_adapt3r.Pi0Adapt3RConfig)
                 return _transforms.Group(
                     inputs=[
@@ -663,27 +663,42 @@ class MESABimanualAdapt3RMultiCamDataConfig(DataConfigFactory):
     order); both the repack mapping and the downstream Adapt3R transform scale with it. The
     resulting model observation uses ``{cam}_0_rgb``/``{cam}_0_depth``/... keys so the
     camera identifiers survive end-to-end.
+
+    ``extra_arms`` is the list of additional arm indices (besides ``ref_arm``) whose
+    ``hand_mat`` should be plumbed into the model observation under
+    ``calibration["hand_mat_robot{i}"]``. The Phase 2 bimanual model needs the second
+    arm's pose to key its action-token RoPE.
     """
 
     cameras: tuple[str, ...] = ()
     ref_arm: int = 0
+    include_depth: bool = True
+    extra_arms: tuple[int, ...] = ()
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         if not self.cameras:
             raise ValueError("MESABimanualAdapt3RMultiCamDataConfig.cameras must be non-empty.")
+        if self.ref_arm in self.extra_arms:
+            raise ValueError(
+                f"extra_arms must not include ref_arm ({self.ref_arm}); got {self.extra_arms}."
+            )
 
         mapping: dict[str, str] = {
             "observation/state": "observation.state",
             "actions": "action",
             "prompt": "prompt",
-            f"observation/hand_mat_robot{self.ref_arm}": f"observation.hand_mat.robot{self.ref_arm}",
         }
         for cam in self.cameras:
             mapping[f"observation/image_{cam}"] = f"observation.images.{cam}"
-            mapping[f"observation/depth_{cam}"] = f"observation.depth.{cam}"
-            mapping[f"observation/intrinsics_{cam}"] = f"observation.intrinsic.{cam}"
-            mapping[f"observation/extrinsics_{cam}"] = f"observation.extrinsic.{cam}"
+            if self.include_depth:
+                mapping[f"observation/depth_{cam}"] = f"observation.depth.{cam}"
+                mapping[f"observation/intrinsics_{cam}"] = f"observation.intrinsic.{cam}"
+                mapping[f"observation/extrinsics_{cam}"] = f"observation.extrinsic.{cam}"
+        if self.include_depth:
+            mapping[f"observation/hand_mat_robot{self.ref_arm}"] = f"observation.hand_mat.robot{self.ref_arm}"
+            for arm in self.extra_arms:
+                mapping[f"observation/hand_mat_robot{arm}"] = f"observation.hand_mat.robot{arm}"
 
         repack_transform = _transforms.Group(
             inputs=[_transforms.RepackTransform(mapping)],
@@ -696,6 +711,8 @@ class MESABimanualAdapt3RMultiCamDataConfig(DataConfigFactory):
                     model_type=model_config.model_type,
                     cameras=tuple(self.cameras),
                     ref_arm=self.ref_arm,
+                    include_depth=self.include_depth,
+                    extra_arms=tuple(self.extra_arms),
                 ),
                 _transforms.DeltaActions(delta_action_mask),
             ],
@@ -875,10 +892,10 @@ _CONFIGS = [
         batch_size=32,
         num_train_steps=25_000,
     ),
-    # Same recipe as ``pi05_mesa_bimanual_lora`` but swaps SigLIP's learned 2D pos-embed for a
-    # per-patch 3D spatial encoding derived from depth + camera calibration (Adapt3R, resize /
-    # eecf / pos_insertion variant). Trains on a sibling dataset that carries the extra depth
-    # and calibration features.
+    # Same recipe as ``pi05_mesa_bimanual_lora`` but swaps SigLIP's learned 2D pos-embed for
+    # 3D RoPE on image tokens keyed by per-patch end-effector-frame xyz (lifted from depth +
+    # camera calibration). Trains on a sibling dataset that carries the extra depth and
+    # calibration features.
     TrainConfig(
         name="pi05_mesa_bimanual_lora_3d",
         model=pi0_adapt3r.Pi0Adapt3RConfig(
@@ -896,11 +913,8 @@ _CONFIGS = [
             ),
             assets=AssetsConfig(asset_id="mesa_bimanual_2task_3d"),
         ),
-        # The 3D positional head (pos_embed_l1/l2, pos_insertion_scale) is absent from pi05_base
-        # and must be initialized fresh — whitelist it so the checkpoint-structure check passes.
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
-            extra_missing_regex=r".*(pos_embed_l1|pos_embed_l2|pos_insertion_scale).*",
         ),
         freeze_filter=pi0_adapt3r.Pi0Adapt3RConfig(
             pi05=True,
@@ -942,7 +956,6 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
-            extra_missing_regex=r".*(pos_embed_l1|pos_embed_l2|pos_insertion_scale).*",
         ),
         freeze_filter=pi0_adapt3r.Pi0Adapt3RConfig(
             pi05=True,
@@ -987,7 +1000,6 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
-            extra_missing_regex=r".*(pos_embed_l1|pos_embed_l2|pos_insertion_scale).*",
         ),
         freeze_filter=pi0_adapt3r.Pi0Adapt3RConfig(
             pi05=True,
@@ -1002,9 +1014,9 @@ _CONFIGS = [
     ),
     # 2D-backbone counterpart to ``pi05_mesa_bimanual_lora_3d_gen_camdrop``: same 4-cam Mesa
     # MimicGen dataset, same camera-dropout recipe (p=0.25, at-most-one drop), but plain
-    # pi0.5 LoRA (no Adapt3R 3D positional head). The data pipeline still ships depth +
-    # calibration (reusing the 3D repo); the 2D model just ignores those fields, which keeps
-    # training config reuse tight without a parallel 2D-only data path.
+    # pi0.5 LoRA (no Adapt3R 3D positional head). It still reuses the 3D LeRobot repo and
+    # shared norm stats, but the model-side input transform drops depth + calibration so the
+    # batch stays a plain RGB Observation.
     TrainConfig(
         name="pi05_mesa_bimanual_lora_2d_gen_camdrop",
         model=pi0_config.Pi0Config(
@@ -1029,6 +1041,130 @@ _CONFIGS = [
             ),
             assets=AssetsConfig(asset_id="mesa_bimanual_gen_2task_3d"),
             cameras=("egocentric", "leftshoulder", "rightshoulder", "midshoulder"),
+            include_depth=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=30_000,
+    ),
+    # Single-camera (egocentric-only) ablation of ``pi05_mesa_bimanual_lora_3d_gen_camdrop``.
+    # Same 3D Adapt3R recipe and shared norm stats, but the data config requests only the
+    # egocentric stream (image + depth + intrinsics + extrinsics + hand_mat), so the other
+    # three views are never read from the LeRobot dataset. No camera dropout (single cam).
+    TrainConfig(
+        name="pi05_mesa_bimanual_lora_3d_gen_ego",
+        model=pi0_adapt3r.Pi0Adapt3RConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            camera_keys=("egocentric_0_rgb",),
+        ),
+        data=MESABimanualAdapt3RMultiCamDataConfig(
+            repo_id="mesa_bimanual_gen_2task_3d",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa_bimanual_gen_2task_3d"),
+            cameras=("egocentric",),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+        ),
+        freeze_filter=pi0_adapt3r.Pi0Adapt3RConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=30_000,
+    ),
+    # Phase 2 of the 3D RoPE work (see markdowns/B.md). Same single-camera (ego) data as
+    # ``pi05_mesa_bimanual_lora_3d_gen_ego`` but the model is ``Pi0Adapt3RBimanualConfig``,
+    # which splits each diffusion chunk-step into two per-arm action tokens (100 total)
+    # and rotates them by 3D RoPE keyed by per-arm gripper xyz in the reference arm's eecf
+    # frame. The data config sets ``extra_arms=(1,)`` so the second arm's hand_mat is
+    # plumbed through alongside the existing reference-arm hand_mat. Phase 2 introduces
+    # three fresh-init params (``action_in_proj_per_arm``, ``action_out_proj_per_arm``,
+    # ``temporal_pos_embed``) absent from ``pi05_base``; the carve-out below tells the
+    # weight loader to keep these missing-from-checkpoint params at their model-side init.
+    TrainConfig(
+        name="pi05_mesa_bimanual_lora_3d_gen_ego_phase2",
+        model=pi0_adapt3r.Pi0Adapt3RBimanualConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            camera_keys=("egocentric_0_rgb",),
+            secondary_arm=1,
+            # Mesa-bimanual action layout is `[jp0(6), grip0(1), jp1(6), grip1(1), pad(18)]`.
+            # `per_arm_action_dim=7` makes the contiguous slice in `_split_per_arm` route
+            # `[jp0, grip0]` to arm 0 and `[jp1, grip1]` to arm 1; the default `action_dim//2`
+            # would put both robots' actions into arm 0 and assign arm 1 to predict pure pad.
+            per_arm_action_dim=7,
+        ),
+        data=MESABimanualAdapt3RMultiCamDataConfig(
+            repo_id="mesa_bimanual_gen_2task_3d",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa_bimanual_gen_2task_3d"),
+            cameras=("egocentric",),
+            extra_arms=(1,),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            extra_missing_regex=r".*(action_in_proj_per_arm|action_out_proj_per_arm|temporal_pos_embed).*",
+        ),
+        freeze_filter=pi0_adapt3r.Pi0Adapt3RBimanualConfig(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            secondary_arm=1,
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=30_000,
+    ),
+    # 2D-backbone counterpart to ``pi05_mesa_bimanual_lora_3d_gen_ego``: plain pi0.5 LoRA on the
+    # same 4-cam MimicGen LeRobot repo, but the data config drops depth + calibration AND requests
+    # only the egocentric image so the other three RGB streams are never read.
+    TrainConfig(
+        name="pi05_mesa_bimanual_lora_2d_gen_ego",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            max_token_len=80,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            camera_keys=("egocentric_0_rgb",),
+        ),
+        data=MESABimanualAdapt3RMultiCamDataConfig(
+            repo_id="mesa_bimanual_gen_2task_3d",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa_bimanual_gen_2task_3d"),
+            cameras=("egocentric",),
+            include_depth=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         freeze_filter=pi0_config.Pi0Config(

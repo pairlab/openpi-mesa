@@ -153,15 +153,27 @@ class MESABimanualAdapt3RMultiCamInputs(transforms.DataTransformFn):
     form ``observation/{image,depth,intrinsics,extrinsics}_{cam}``; the transform emits
     model-side entries ``{cam}_0_rgb``, ``{cam}_0_depth``, ``{cam}_intrinsics``,
     ``{cam}_extrinsics``. The reference arm for ``hand_mat`` is selectable via ``ref_arm``.
+
+    ``extra_arms`` lists additional arm indices whose ``hand_mat`` should also be emitted
+    (under the calibration key ``hand_mat_robot{i}``); the reference arm itself is always
+    available as ``hand_mat`` (and the inverse as ``hand_mat_inv``). This is what the
+    Phase 2 bimanual model uses to compute the second arm's position in the reference
+    arm's eecf frame.
     """
 
     model_type: _model.ModelType
     cameras: tuple[str, ...]
     ref_arm: int = 0
+    include_depth: bool = True
+    extra_arms: tuple[int, ...] = ()
 
     def __call__(self, data: dict) -> dict:
         if not self.cameras:
             raise ValueError("MESABimanualAdapt3RMultiCamInputs.cameras must be non-empty.")
+        if self.ref_arm in self.extra_arms:
+            raise ValueError(
+                f"extra_arms must not include ref_arm ({self.ref_arm}); got {self.extra_arms}."
+            )
 
         image_dict: dict[str, np.ndarray] = {}
         mask_dict: dict[str, np.bool_] = {}
@@ -171,25 +183,30 @@ class MESABimanualAdapt3RMultiCamInputs(transforms.DataTransformFn):
         for cam in self.cameras:
             image_dict[f"{cam}_0_rgb"] = _parse_image(data[f"observation/image_{cam}"])
             mask_dict[f"{cam}_0_rgb"] = np.True_
-            depth_dict[f"{cam}_0_depth"] = _parse_depth(data[f"observation/depth_{cam}"])
-            calibration[f"{cam}_intrinsics"] = np.asarray(
-                data[f"observation/intrinsics_{cam}"], dtype=np.float32
-            )
-            calibration[f"{cam}_extrinsics"] = np.asarray(
-                data[f"observation/extrinsics_{cam}"], dtype=np.float32
-            )
-
-        hand_mat = np.asarray(data[f"observation/hand_mat_robot{self.ref_arm}"], dtype=np.float32)
-        calibration["hand_mat"] = hand_mat
-        calibration["hand_mat_inv"] = np.linalg.inv(hand_mat).astype(np.float32)
+            if self.include_depth:
+                depth_dict[f"{cam}_0_depth"] = _parse_depth(data[f"observation/depth_{cam}"])
+                calibration[f"{cam}_intrinsics"] = np.asarray(
+                    data[f"observation/intrinsics_{cam}"], dtype=np.float32
+                )
+                calibration[f"{cam}_extrinsics"] = np.asarray(
+                    data[f"observation/extrinsics_{cam}"], dtype=np.float32
+                )
 
         inputs = {
             "state": data["observation/state"],
             "image": image_dict,
             "image_mask": mask_dict,
-            "depth": depth_dict,
-            "calibration": calibration,
         }
+        if self.include_depth:
+            hand_mat = np.asarray(data[f"observation/hand_mat_robot{self.ref_arm}"], dtype=np.float32)
+            calibration["hand_mat"] = hand_mat
+            calibration["hand_mat_inv"] = np.linalg.inv(hand_mat).astype(np.float32)
+            for arm in self.extra_arms:
+                calibration[f"hand_mat_robot{arm}"] = np.asarray(
+                    data[f"observation/hand_mat_robot{arm}"], dtype=np.float32
+                )
+            inputs["depth"] = depth_dict
+            inputs["calibration"] = calibration
 
         if "actions" in data:
             inputs["actions"] = data["actions"]
