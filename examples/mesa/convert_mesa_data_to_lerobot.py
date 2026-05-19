@@ -1,4 +1,4 @@
-"""Convert Mesa bimanual HDF5 data to the LeRobot v2.0 dataset format.
+"""Convert Mesa bimanual HDF5 data to the LeRobot v3.0 dataset format.
 
 Each HDF5 holds one or more demos under ``data/demo_N``. An episode is written
 per demo. Actions are the 14-D ``actions_joint_pos`` (absolute joint-space
@@ -27,8 +27,8 @@ import shutil
 from typing import Literal
 
 import h5py
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
 import tqdm
 import tyro
