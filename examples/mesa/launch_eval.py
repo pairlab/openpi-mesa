@@ -128,9 +128,32 @@ async def main():
     parser.add_argument("--robots", nargs="+",
                         default=["ReverseMountedYam", "ReverseMountedYam"])
     parser.add_argument("--visualization-camera-name", default="egocentric")
+    parser.add_argument(
+        "--keep-cameras",
+        default="",
+        help=(
+            "Comma-separated bare cam names whose image_mask stays True at "
+            "inference. All other cameras have their mask zeroed in the policy "
+            "server (mirrors camdrop training semantics). Empty = keep all. "
+            "Only honored by multi-cam configs."
+        ),
+    )
 
     parser.add_argument("--video-out-path",
                         default=os.path.join(os.getcwd(), "experiments", "vla_benchmark"))
+
+    parser.add_argument(
+        "--camera-overrides",
+        default=None,
+        help=(
+            "JSON string mapping camera-name → field overrides applied to "
+            "parsed_problem['camera'] before make_env(). Used to test policies "
+            "on out-of-distribution camera poses (e.g. wider phi/theta_radius "
+            "than training saw). Forwarded verbatim to "
+            "vla-benchmark/scripts/eval_server_parallel.py --camera-overrides. "
+            "Empty / unset = no override (BDDL randomization unchanged)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -152,6 +175,8 @@ async def main():
         "--checkpoint-dir", args.checkpoint_dir,
         "--port", str(port),
     ]
+    if args.keep_cameras:
+        serve_cmd += ["--keep-cameras", args.keep_cameras]
 
     eval_cmd = [
         os.path.join(script_dir, "run-vla-benchmark.sh"),
@@ -177,10 +202,16 @@ async def main():
     if args.max_steps is not None:
         eval_cmd.append(f"--max-steps={args.max_steps}")
 
+    if args.camera_overrides:
+        eval_cmd.append(f"--camera-overrides={args.camera_overrides}")
+
     # 3D configs (Pi0Adapt3R) need depth + calibration on the wire. Depth is
     # enabled via --camera-depths and must be transported in meters to match
     # training (see examples/mesa/convert_mesa_data_to_lerobot.py:linearize_depth).
-    if args.config.endswith("_3d"):
+    # Matches both the legacy ``*_3d`` configs and the multi-cam camdrop
+    # variants ``*_3d_gen[_camdrop]``; explicitly excludes ``*_2d_*``.
+    needs_depth = ("_3d" in args.config) and ("_2d" not in args.config)
+    if needs_depth:
         eval_cmd.append("--camera-depths")
         eval_cmd.append("--depth-transport=meters")
 

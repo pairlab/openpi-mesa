@@ -11,12 +11,15 @@
 #SBATCH -o examples/mesa/slurm_logs/eval_%j.out
 #SBATCH -e examples/mesa/slurm_logs/eval_%j.err
 #
-# Overfit eval for the pi05_mesa_bimanual_lora checkpoint: runs the trained
+# Overfit eval for a pi05_mesa_bimanual_lora[_3d] checkpoint: runs the trained
 # model against the four init-states that were also in its training set
 # (mesa_bimanual/apple_tray_on, overfit split).
 #
 # Env overrides:
-#   CHECKPOINT_DIR   step dir to load (default: latest under v2 exp)
+#   CONFIG           training config name; selects 2D vs 3D path.
+#                    default: pi05_mesa_bimanual_lora
+#                    3D:      pi05_mesa_bimanual_lora_3d
+#   CHECKPOINT_DIR   step dir to load (default depends on CONFIG)
 #   EXP_NAME         experiment name in the output tree (default: pi05_mesa_smoke)
 #   VARIANT_NAME     variant name (default: ${step}-smoke)
 #   NUM_ROLLOUTS     rollouts per task (default: 4)
@@ -32,7 +35,24 @@ REPO_DIR="/storage/home/hcoda1/5/fchang40/openpi-mesa"
 PROJECT_DIR="/storage/project/r-agarg35-0/fchang40"
 cd "$REPO_DIR"
 
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-$PROJECT_DIR/checkpoints/pi05_mesa_bimanual_lora/pi05_bimanual_2task_lora_v2/9000}"
+CONFIG="${CONFIG:-pi05_mesa_bimanual_lora}"
+case "$CONFIG" in
+    pi05_mesa_bimanual_lora)
+        DEFAULT_CKPT="$PROJECT_DIR/checkpoints/pi05_mesa_bimanual_lora/pi05_bimanual_2task_lora_v2/9000"
+        ;;
+    pi05_mesa_bimanual_lora_3d)
+        DEFAULT_CKPT="$PROJECT_DIR/checkpoints/pi05_mesa_bimanual_lora_3d/mesa_bimanual_lora_3d_v1/7000"
+        ;;
+    *)
+        DEFAULT_CKPT=""
+        ;;
+esac
+
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$DEFAULT_CKPT}"
+if [ -z "$CHECKPOINT_DIR" ]; then
+    echo "CHECKPOINT_DIR must be set for CONFIG=$CONFIG (no default known)" >&2
+    exit 2
+fi
 STEP_TAG="$(basename "$CHECKPOINT_DIR")"
 
 EXP_NAME="${EXP_NAME:-pi05_mesa_smoke}"
@@ -75,6 +95,7 @@ echo "[eval] out=$REPO_DIR/experiments/vla_benchmark/$EVAL_SET_NAME/$EXP_NAME/$V
 
 uv run examples/mesa/launch_eval.py \
     --checkpoint-dir "$CHECKPOINT_DIR" \
+    --config "$CONFIG" \
     --exp-name "$EXP_NAME" \
     --variant-name "$VARIANT_NAME" \
     --eval-set-name "$EVAL_SET_NAME" \
