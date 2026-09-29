@@ -527,6 +527,56 @@ class MESADataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class BiMESADataConfig(DataConfigFactory):
+    """Config for the bimanual BiMESA LeRobot dataset (e.g. albertwilcox/bimesa-57-lerobot).
+
+    State and actions are 14-D absolute joint positions: robot0 (6 joints + gripper) | robot1 (6 joints + gripper).
+    Joint dimensions are converted to deltas relative to the current state; gripper dimensions stay absolute.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "egocentric": "observation.images.egocentric",
+                            "robot0_eye_in_hand": "observation.images.robot0_eye_in_hand",
+                            "robot1_eye_in_hand": "observation.images.robot1_eye_in_hand",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        data_transforms = _transforms.Group(
+            inputs=[
+                mesa_policy.BiMESAInputs(model_type=model_config.model_type),
+                _transforms.DeltaActions(delta_action_mask),
+            ],
+            outputs=[
+                _transforms.AbsoluteActions(delta_action_mask),
+                mesa_policy.BiMESAOutputs(action_dim=14),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -684,6 +734,55 @@ _CONFIGS = [
         batch_size=1,
         num_train_steps=50_000,
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+    ),
+    #
+    # BiMESA (bimanual) configs.
+    #
+    TrainConfig(
+        name="pi0_bimesa",
+        model=pi0_config.Pi0Config(action_horizon=20, max_token_len=40),
+        data=BiMESADataConfig(
+            repo_id="albertwilcox/bimesa-57-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="bimesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+    ),
+    TrainConfig(
+        name="pi05_bimesa",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=80),
+        data=BiMESADataConfig(
+            repo_id="albertwilcox/bimesa-57-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="bimesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    ),
+    TrainConfig(
+        name="pi0_fast_bimesa",
+        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=20, max_token_len=180),
+        data=BiMESADataConfig(
+            repo_id="albertwilcox/bimesa-57-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="bimesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
     ),
 
 

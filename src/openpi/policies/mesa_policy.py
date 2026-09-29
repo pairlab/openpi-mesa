@@ -88,3 +88,63 @@ class MESAOutputs(transforms.DataTransformFn):
         # For your own dataset, replace `7` with the action dimension of your dataset.
         result = {"actions": np.asarray(data["actions"][:, :self.action_dim])}
         return result
+
+
+@dataclasses.dataclass(frozen=True)
+class BiMESAInputs(transforms.DataTransformFn):
+    """Inputs for the bimanual BiMESA setup (two ReverseMountedYam arms).
+
+    Expected inputs:
+    - images: dict with keys "egocentric", "robot0_eye_in_hand", "robot1_eye_in_hand";
+      each image is [C, H, W] or [H, W, C].
+    - state: [14] = robot0_joint_pos (6) | robot0_gripper_jaw_width (1) | robot1_joint_pos (6) | robot1_gripper_jaw_width (1)
+    - actions: [action_horizon, 14], same layout as the state (training only).
+    """
+
+    model_type: _model.ModelType
+
+    EXPECTED_CAMERAS = ("egocentric", "robot0_eye_in_hand", "robot1_eye_in_hand")
+
+    def __call__(self, data: dict) -> dict:
+        in_images = data["images"]
+        if set(in_images) - set(self.EXPECTED_CAMERAS):
+            raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
+        if "egocentric" not in in_images:
+            raise ValueError("BiMESA inputs require an 'egocentric' image")
+
+        base_image = _parse_image(in_images["egocentric"])
+        images = {"base_0_rgb": base_image}
+        image_masks = {"base_0_rgb": np.True_}
+
+        # robot0 (left arm) wrist -> left wrist slot, robot1 (right arm) wrist -> right wrist slot.
+        for dest, source in (("left_wrist_0_rgb", "robot0_eye_in_hand"), ("right_wrist_0_rgb", "robot1_eye_in_hand")):
+            if source in in_images:
+                images[dest] = _parse_image(in_images[source])
+                image_masks[dest] = np.True_
+            else:
+                images[dest] = np.zeros_like(base_image)
+                image_masks[dest] = np.False_
+
+        inputs = {
+            "state": data["state"],
+            "image": images,
+            "image_mask": image_masks,
+        }
+
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class BiMESAOutputs(transforms.DataTransformFn):
+    """Outputs for the BiMESA setup: 14-D absolute joint-position actions (robot0 | robot1)."""
+
+    action_dim: int = 14
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}
