@@ -146,13 +146,18 @@ def preprocess_observation(
     observation: Observation,
     *,
     train: bool = False,
-    image_keys: Sequence[str] = IMAGE_KEYS,
+    image_keys: Sequence[str] | None = None,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
+
+    If `image_keys` is None, the subset of IMAGE_KEYS present in the observation is used (e.g. MESA single-arm models
+    are trained on base + left wrist only).
     """
 
+    if image_keys is None:
+        image_keys = [key for key in IMAGE_KEYS if key in observation.images]
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 

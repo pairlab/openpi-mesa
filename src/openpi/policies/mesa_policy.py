@@ -36,9 +36,8 @@ class MESAInputs(transforms.DataTransformFn):
         # in a different key than "observation/image" or "observation/wrist_image",
         # you should change it below.
         # Pi0 models support three image inputs at the moment: one third-person view,
-        # and two wrist views (left and right). If your dataset does not have a particular type
-        # of image, e.g. wrist images, you can comment it out here and replace it with zeros like we do for the
-        # right wrist image below.
+        # and two wrist views (left and right). The released MESA models were trained with only the
+        # left-shoulder and wrist views, so no right-wrist slot is passed to the model.
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
 
@@ -48,12 +47,10 @@ class MESAInputs(transforms.DataTransformFn):
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
-                "right_wrist_0_rgb": np.zeros_like(base_image),
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.False_,
             },
         }
 

@@ -707,7 +707,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_fast_mesa_70",
-        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=20),
+        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=20, max_token_len=120),
         data=MESADataConfig(
             repo_id="albertwilcox/mesa-70-lerobot",
             base_config=DataConfig(
