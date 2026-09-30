@@ -6,6 +6,17 @@
 
 ## MESA and BiMESA
 
+### Installation
+
+```bash
+git clone --recurse-submodules https://github.com/pairlab/openpi-mesa.git
+cd openpi-mesa
+GIT_LFS_SKIP_SMUDGE=1 uv sync
+GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+```
+
+The rest of the upstream [installation notes](#installation) (GPU requirements, Docker) also apply.
+
 ### Configs
 
 | Config | Setting | Model | Training data | Released checkpoint |
@@ -28,7 +39,7 @@ and the egocentric and both wrist cameras for BiMESA, plus joint positions, grip
 Download a checkpoint and start the policy server:
 
 ```bash
-huggingface-cli download albertwilcox/bimesa-pi05 --local-dir checkpoints/bimesa-pi05
+uv run huggingface-cli download albertwilcox/bimesa-pi05 --local-dir checkpoints/bimesa-pi05
 uv run scripts/serve_policy.py --port 8001 policy:checkpoint \
   --policy.config=pi05_bimesa --policy.dir=checkpoints/bimesa-pi05
 ```
