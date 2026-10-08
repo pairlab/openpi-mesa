@@ -1,5 +1,86 @@
 # openpi
 
+> **MESA fork.** This fork of openpi adds configs and serving support for the [MESA](https://pairlab.github.io/MESA/)
+> benchmark (single-arm MESA and bimanual BiMESA). See [MESA and BiMESA](#mesa-and-bimesa) below; the rest of this
+> README is the upstream openpi README.
+
+## MESA and BiMESA
+
+### Installation
+
+```bash
+git clone --recurse-submodules https://github.com/pairlab/openpi-mesa.git
+cd openpi-mesa
+GIT_LFS_SKIP_SMUDGE=1 uv sync
+GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+```
+
+The rest of the upstream [installation notes](#installation) (GPU requirements, Docker) also apply.
+
+### Configs
+
+| Config | Setting | Model | Training data | Released checkpoint |
+|---|---|---|---|---|
+| `pi0_mesa` | MESA (single-arm Franka) | π0 | [mesa-70-lerobot](https://huggingface.co/datasets/albertwilcox/mesa-70-lerobot) | [albertwilcox/mesa-pi0](https://huggingface.co/albertwilcox/mesa-pi0) |
+| `pi0_fast_mesa_70` | MESA | π0-FAST | mesa-70-lerobot | [albertwilcox/mesa-pi0-fast](https://huggingface.co/albertwilcox/mesa-pi0-fast) |
+| `pi05_mesa` | MESA | π0.5 | mesa-70-lerobot | [albertwilcox/mesa-pi05](https://huggingface.co/albertwilcox/mesa-pi05) |
+| `pg_fm_mesa` | MESA | PaliGemma + flow matching (PG-FM) | mesa-70-lerobot | – |
+| `pi0_bimesa` | BiMESA (two ReverseMountedYam arms) | π0 | [bimesa-57-lerobot](https://huggingface.co/datasets/albertwilcox/bimesa-57-lerobot) | [albertwilcox/bimesa-pi0](https://huggingface.co/albertwilcox/bimesa-pi0) |
+| `pi0_fast_bimesa` | BiMESA | π0-FAST | bimesa-57-lerobot | [albertwilcox/bimesa-pi0-fast](https://huggingface.co/albertwilcox/bimesa-pi0-fast) |
+| `pi05_bimesa` | BiMESA | π0.5 | bimesa-57-lerobot | [albertwilcox/bimesa-pi05](https://huggingface.co/albertwilcox/bimesa-pi05) |
+
+All checkpoints are also collected [here](https://huggingface.co/collections/albertwilcox/mesa). The models use
+relative joint-position actions (grippers absolute) with 20-step action chunks at 20 Hz; the MESA evaluation server
+executes the first 5 actions of each chunk before replanning. Inputs are the left-shoulder and wrist cameras for MESA,
+and the egocentric and both wrist cameras for BiMESA, plus joint positions, gripper widths, and the language instruction.
+
+### Serving a checkpoint for MESA evaluation
+
+Download a checkpoint and start the policy server:
+
+```bash
+uv run huggingface-cli download albertwilcox/bimesa-pi05 --local-dir checkpoints/bimesa-pi05
+uv run scripts/serve_policy.py --port 8001 policy:checkpoint \
+  --policy.config=pi05_bimesa --policy.dir=checkpoints/bimesa-pi05
+```
+
+`serve_policy.py` translates the observations sent by the MESA evaluation server into the policy's input format. The
+format is inferred from the config name (`*_bimesa` -> `bimesa`, other `*_mesa*` configs -> `mesa`); override it with
+`--policy-format {mesa,bimesa,none}`.
+
+Then, from the [MESA](https://pairlab.github.io/MESA/) repository, run the evaluation server against the same port:
+
+```bash
+# Single-arm MESA
+uv run scripts/eval_server_parallel.py --port 8001 --eval-set-name mesa-70 \
+  --num-rollouts-per-task 50 --controller-type joint_pos
+
+# Bimanual BiMESA
+uv run scripts/eval_server_parallel.py --port 8001 --eval-set-name bimesa-id \
+  --num-rollouts-per-task 50 --controller-type joint_pos \
+  --robots ReverseMountedYam ReverseMountedYam \
+  --camera-names egocentric robot0_eye_in_hand robot1_eye_in_hand \
+  --state-keys robot0_joint_pos robot0_gripper_jaw_width robot1_joint_pos robot1_gripper_jaw_width
+```
+
+See the [MESA documentation](https://pairlab.github.io/MESA/documentation/index.html) for the full list of evaluation
+suites.
+
+### Training
+
+The configs above download their datasets from Hugging Face. Training follows the standard openpi workflow; the paper
+models were trained for 50k steps with batch size 128:
+
+```bash
+uv run scripts/compute_norm_stats.py --config-name pi05_bimesa
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_bimesa --exp-name=my_run
+```
+
+Instead of recomputing normalization statistics, you can copy `assets/<asset_id>/norm_stats.json` from a released
+checkpoint into `assets/<config name>/<asset_id>/` (`asset_id` is `mesa` for MESA configs and `bimesa` for BiMESA configs).
+
+## About openpi
+
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
 
 Currently, this repo contains three types of models:

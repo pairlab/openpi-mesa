@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.mesa_policy as mesa_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -89,6 +90,9 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # Optional LeRobot video decoder backend, e.g. "pyav".
+    # If None, LeRobot uses its default backend.
+    video_backend: str | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -463,6 +467,116 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class MESADataConfig(DataConfigFactory):
+    """Config for composing multiple VLA Benchmark subdatasets.
+
+    This allows training on a subset of tasks by combining individual subdatasets
+    that were converted separately from HDF5 files.
+
+    Example usage:
+        MESADataConfig(
+            assets=AssetsConfig(asset_id="mesa_global"),  # Shared norm_stats
+        )
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        action_key = "actions_joint_pos"
+        proprio_key = "robot0_joint_pos+robot0_gripper_jaw_width"
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "leftshoulder_image",
+                        "observation/wrist_image": "robot0_eye_in_hand_image",
+                        "observation/state": proprio_key,
+                        "actions": action_key,
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        delta_action_mask = _transforms.make_bool_mask(7, -1)
+        data_transforms = _transforms.Group(
+            inputs=[
+                mesa_policy.MESAInputs(model_type=model_config.model_type),
+                _transforms.DeltaActions(delta_action_mask),
+            ],
+            outputs=[
+                _transforms.AbsoluteActions(delta_action_mask),
+                mesa_policy.MESAOutputs(action_dim=8),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        action_sequence_keys = ("actions_joint_pos",)
+
+        # Get base config with shared norm_stats from asset_id
+        base_config = self.create_base_config(assets_dirs, model_config)
+
+        return dataclasses.replace(
+            base_config,
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class BiMESADataConfig(DataConfigFactory):
+    """Config for the bimanual BiMESA LeRobot dataset (e.g. albertwilcox/bimesa-57-lerobot).
+
+    State and actions are 14-D absolute joint positions: robot0 (6 joints + gripper) | robot1 (6 joints + gripper).
+    Joint dimensions are converted to deltas relative to the current state; gripper dimensions stay absolute.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "egocentric": "observation.images.egocentric",
+                            "robot0_eye_in_hand": "observation.images.robot0_eye_in_hand",
+                            "robot1_eye_in_hand": "observation.images.robot1_eye_in_hand",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        data_transforms = _transforms.Group(
+            inputs=[
+                mesa_policy.BiMESAInputs(model_type=model_config.model_type),
+                _transforms.DeltaActions(delta_action_mask),
+            ],
+            outputs=[
+                _transforms.AbsoluteActions(delta_action_mask),
+                mesa_policy.BiMESAOutputs(action_dim=14),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -558,6 +672,120 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    #
+    # MESA configs.
+    #
+    TrainConfig(
+        name="pi0_mesa",
+        model=pi0_config.Pi0Config(action_horizon=20, max_token_len=24),
+        data=MESADataConfig(
+            repo_id="albertwilcox/mesa-70-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+    ),
+    TrainConfig(
+        name="pi05_mesa",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=60),
+        data=MESADataConfig(
+            repo_id="albertwilcox/mesa-70-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    ),
+    TrainConfig(
+        name="pi0_fast_mesa_70",
+        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=20, max_token_len=120),
+        data=MESADataConfig(
+            repo_id="albertwilcox/mesa-70-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+    ),
+    TrainConfig(
+        name="pg_fm_mesa",
+        model=pi0_config.Pi0Config(action_horizon=20, max_token_len=24),
+        data=MESADataConfig(
+            repo_id="albertwilcox/mesa-70-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="mesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+    ),
+    #
+    # BiMESA (bimanual) configs.
+    #
+    TrainConfig(
+        name="pi0_bimesa",
+        model=pi0_config.Pi0Config(action_horizon=20, max_token_len=40),
+        data=BiMESADataConfig(
+            repo_id="albertwilcox/bimesa-57-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="bimesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+    ),
+    TrainConfig(
+        name="pi05_bimesa",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=80),
+        data=BiMESADataConfig(
+            repo_id="albertwilcox/bimesa-57-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="bimesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    ),
+    TrainConfig(
+        name="pi0_fast_bimesa",
+        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=20, max_token_len=180),
+        data=BiMESADataConfig(
+            repo_id="albertwilcox/bimesa-57-lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+            assets=AssetsConfig(asset_id="bimesa"),
+        ),
+        batch_size=128,
+        num_train_steps=50_000,
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+    ),
+
+
     #
     # Inference Aloha configs.
     #

@@ -2,6 +2,7 @@ import dataclasses
 import enum
 import logging
 import socket
+from typing import Literal
 
 import tyro
 
@@ -18,6 +19,14 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
+
+
+# Observation format sent by the client (e.g. MESA's eval_server_parallel.py):
+#   auto   - infer from the config name: "*bimesa*" -> bimesa, other "*mesa*" -> mesa, otherwise none.
+#   mesa   - single-arm MESA: images={leftshoulder, robot0_eye_in_hand}, 8-D state.
+#   bimesa - bimanual BiMESA: images={egocentric, robot0_eye_in_hand, robot1_eye_in_hand}, 14-D state.
+#   none   - pass observations to the policy unchanged.
+PolicyFormat = Literal["auto", "mesa", "bimesa", "none"]
 
 
 @dataclasses.dataclass
@@ -50,6 +59,9 @@ class Args:
     port: int = 8000
     # Record the policy's behavior for debugging.
     record: bool = False
+
+    # Observation format of the client. Use "mesa" or "bimesa" when serving to the MESA evaluation server.
+    policy_format: PolicyFormat = "auto"
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -96,8 +108,63 @@ def create_policy(args: Args) -> _policy.Policy:
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 
+class MESAPolicyWrapper(_policy.Policy):
+    def __init__(self, policy: _policy.Policy):
+        self.policy = policy
+    
+    def infer(self, obs: dict) -> dict:
+        new_obs = {
+            "observation/image": obs["images"]["leftshoulder"],
+            "observation/wrist_image": obs["images"]["robot0_eye_in_hand"],
+            "observation/state": obs["state"],
+            "prompt": obs["prompt"],
+        }
+        outputs = self.policy.infer(new_obs)
+        return outputs
+    
+    @property
+    def metadata(self) -> dict:
+        return self.policy.metadata
+
+
+class BiMESAPolicyWrapper(_policy.Policy):
+    """Forwards BiMESA observations ({images: {egocentric, robot0_eye_in_hand, robot1_eye_in_hand}, state, prompt})."""
+
+    def __init__(self, policy: _policy.Policy):
+        self.policy = policy
+
+    def infer(self, obs: dict) -> dict:
+        new_obs = {
+            "images": {k: obs["images"][k] for k in ("egocentric", "robot0_eye_in_hand", "robot1_eye_in_hand")},
+            "state": obs["state"],
+            "prompt": obs["prompt"],
+        }
+        return self.policy.infer(new_obs)
+
+    @property
+    def metadata(self) -> dict:
+        return self.policy.metadata
+
+
+def resolve_policy_format(args: Args) -> PolicyFormat:
+    if args.policy_format != "auto":
+        return args.policy_format
+    if isinstance(args.policy, Checkpoint):
+        if "bimesa" in args.policy.config:
+            return "bimesa"
+        if "mesa" in args.policy.config:
+            return "mesa"
+    return "none"
+
+
 def main(args: Args) -> None:
     policy = create_policy(args)
+    policy_format = resolve_policy_format(args)
+    logging.info("Using policy format: %s", policy_format)
+    if policy_format == "mesa":
+        policy = MESAPolicyWrapper(policy)
+    elif policy_format == "bimesa":
+        policy = BiMESAPolicyWrapper(policy)
     policy_metadata = policy.metadata
 
     # Record the policy's behavior.
